@@ -24,11 +24,17 @@ end
 
 ## abstract interpreter
 
+const InfCacheT = @static if isdefined(CC, :InferenceCache)
+    CC.InferenceCache
+else
+    Vector{CC.InferenceResult}
+end
+
 struct CustomInterpreter <: CC.AbstractInterpreter
     world::UInt
     cache::CacheView
     method_table::CC.OverlayMethodTable
-    inf_cache::Vector{CC.InferenceResult}
+    inf_cache::InfCacheT
     inf_params::CC.InferenceParams
     opt_params::CC.OptimizationParams
 
@@ -36,7 +42,7 @@ struct CustomInterpreter <: CC.AbstractInterpreter
         @assert cache.world <= get_world_counter()
         new(cache.world, cache,
             CC.OverlayMethodTable(cache.world, CUSTOM_MT),
-            Vector{CC.InferenceResult}(),
+            InfCacheT(),
             CC.InferenceParams(),
             CC.OptimizationParams()
         )

@@ -9,6 +9,12 @@ mutable struct TestResults
     TestResults() = new(nothing)
 end
 
+const InfCacheT = @static if isdefined(Core.Compiler, :InferenceCache)
+    Core.Compiler.InferenceCache
+else
+    Vector{Core.Compiler.InferenceResult}
+end
+
 @testset "CompilerCaching" verbose=true begin
 
 @testset "basic caching" begin
@@ -148,10 +154,10 @@ end
     struct TestInterpreter <: Core.Compiler.AbstractInterpreter
         world::UInt
         cache::CacheView
-        inf_cache::Vector{Core.Compiler.InferenceResult}
+        inf_cache::InfCacheT
     end
     TestInterpreter(cache::CacheView) =
-        TestInterpreter(cache.world, cache, Core.Compiler.InferenceResult[])
+        TestInterpreter(cache.world, cache, InfCacheT())
     @setup_caching TestInterpreter.cache
 
     Core.Compiler.InferenceParams(::TestInterpreter) = Core.Compiler.InferenceParams()

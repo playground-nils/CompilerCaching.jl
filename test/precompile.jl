@@ -28,6 +28,12 @@ precompile_test_harness("Inference caching") do load_path
 
         const CC = Core.Compiler
 
+        const InfCacheT = @static if isdefined(CC, :InferenceCache)
+            CC.InferenceCache
+        else
+            Vector{CC.InferenceResult}
+        end
+
         # Results struct for this compiler
         mutable struct CompileResults
             ir::Any
@@ -39,10 +45,10 @@ precompile_test_harness("Inference caching") do load_path
         struct ExampleInterpreter <: CC.AbstractInterpreter
             world::UInt
             cache::CacheView
-            inf_cache::Vector{CC.InferenceResult}
+            inf_cache::InfCacheT
         end
         ExampleInterpreter(cache::CacheView) =
-            ExampleInterpreter(cache.world, cache, CC.InferenceResult[])
+            ExampleInterpreter(cache.world, cache, InfCacheT())
 
         CC.InferenceParams(::ExampleInterpreter) = CC.InferenceParams()
         CC.OptimizationParams(::ExampleInterpreter) = CC.OptimizationParams()
