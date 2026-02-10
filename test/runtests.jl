@@ -486,7 +486,12 @@ end
         name = splitext(basename(example))[1]
         @testset "$name" begin
             cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) $example`
-            @test success(pipeline(cmd; stdout=devnull, stderr=devnull))
+            buf = IOBuffer()
+            ok = success(pipeline(cmd; stdout=buf, stderr=buf))
+            if !ok
+                print(String(take!(buf)))
+            end
+            @test ok
         end
     end
 end
