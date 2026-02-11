@@ -155,7 +155,7 @@ precompile_test_harness("Inference caching") do load_path
         @test ExampleCompiler.emit_code_count[] == 0
 
         # check that identity survived
-        @show ext_cis_lost = v"1.12.0-DEV.1268"<=VERSION<v"1.12.5" || v"1.13-"<=VERSION
+        ext_cis_lost = v"1.12.0-DEV.1268"<=VERSION<v"1.12.5" || v"1.13-"<=VERSION
         @test haskey(cache, identity_mi) broken=ext_cis_lost
         ExampleCompiler.precompile(identity, (Int,))
         @test ExampleCompiler.emit_code_count[] == 0 broken=ext_cis_lost
