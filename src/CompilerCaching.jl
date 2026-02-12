@@ -23,6 +23,87 @@ include("utils.jl")
 export CacheView, @setup_caching, results
 
 """
+    SpecializedResult{V}
+
+A specialized inference result for specific argument types.
+"""
+struct SpecializedResult{V}
+    argtypes::Vector{Any}
+    inner::V
+    src::Any
+    rettype::Any
+    rettype_const::Any
+end
+
+"""
+    CachedResult{V}
+
+Mutable wrapper for analysis results that supports both generic and const-specialized
+entries. Stored once in the CI's `analysis_results` chain at creation time. Const-prop
+entries are accumulated by pushing to `const_entries`.
+"""
+mutable struct CachedResult{V}
+    inner::V
+    const_entries::Vector{SpecializedResult{V}}
+    CachedResult{V}(inner::V) where V = new{V}(inner, SpecializedResult{V}[])
+end
+
+"""
+    get_invoke_mi(stmt::Expr) -> Union{MethodInstance, Nothing}
+
+Version-portable extraction of the callee MethodInstance from an `:invoke` statement.
+On 1.12+ the first arg may be a CodeInstance; on 1.11 it's a MethodInstance directly.
+"""
+function get_invoke_mi(stmt::Expr)
+    target = stmt.args[1]
+    @static if VERSION >= v"1.12-"
+        target isa Core.CodeInstance && return CC.get_ci_mi(target)
+    end
+    target isa Core.MethodInstance && return target
+    return nothing
+end
+
+"""
+    extract_invoke_argtypes(stmt::Expr, src::Core.CodeInfo, sptypes) -> Vector{Any}
+
+Extract inferred argument types at each position of an `:invoke` call using `CC.argextype`.
+Skips the invoke target at position 1.
+"""
+function extract_invoke_argtypes(stmt::Expr, src::Core.CodeInfo, sptypes)
+    argtypes = Any[]
+    for j in 2:length(stmt.args)
+        if src.slottypes !== nothing
+            push!(argtypes, CC.argextype(stmt.args[j], src, sptypes))
+        else
+            push!(argtypes, Any)
+        end
+    end
+    return argtypes
+end
+
+"""
+    extract_invoke_argtypes(stmt, src, sptypes, parent_argtypes) -> Vector{Any}
+
+Like `extract_invoke_argtypes`, but resolves `Argument(i)` nodes using the parent's
+const-enriched argtypes instead of the source's generic slot types.
+"""
+function extract_invoke_argtypes(stmt::Expr, src::Core.CodeInfo, sptypes,
+                                 parent_argtypes::Vector{Any})
+    argtypes = Any[]
+    for j in 2:length(stmt.args)
+        arg = stmt.args[j]
+        if arg isa Core.Argument && checkbounds(Bool, parent_argtypes, arg.n)
+            push!(argtypes, parent_argtypes[arg.n])
+        elseif src.slottypes !== nothing
+            push!(argtypes, CC.argextype(arg, src, sptypes))
+        else
+            push!(argtypes, Any)
+        end
+    end
+    return argtypes
+end
+
+"""
     CacheView{K, V}
 
 A cache into a cache partition at a specific world age. Serves as the main entry point
@@ -61,7 +142,8 @@ macro setup_caching(expr)
         quote
             function $CC.finish!(interp::$InterpType, caller::$CC.InferenceState,
                                  validation_world::UInt, time_before::UInt64)
-                $CC.stack_analysis_result!(caller.result, $results_type(interp.$cache_field)())
+                V = $results_type(interp.$cache_field)
+                $CC.stack_analysis_result!(caller.result, $CachedResult{V}(V()))
                 @invoke $CC.finish!(interp::$CC.AbstractInterpreter, caller::$CC.InferenceState,
                                     validation_world::UInt, time_before::UInt64)
             end
@@ -69,7 +151,8 @@ macro setup_caching(expr)
     else
         quote
             function $CC.finish!(interp::$InterpType, caller::$CC.InferenceState)
-                $CC.stack_analysis_result!(caller.result, $results_type(interp.$cache_field)())
+                V = $results_type(interp.$cache_field)
+                $CC.stack_analysis_result!(caller.result, $CachedResult{V}(V()))
                 @invoke $CC.finish!(interp::$CC.AbstractInterpreter, caller::$CC.InferenceState)
             end
         end
@@ -99,19 +182,39 @@ results_type(::CacheView{K,V}) where {K,V} = V
     results(::Type{V}, ci::CodeInstance)::V
     results(cache::CacheView{K,V}, ci::CodeInstance)::V
 
-Retrieve the typed results struct from a CodeInstance's `analysis_results` chain.
+Retrieve the generic typed results struct from a CodeInstance's `analysis_results` chain.
 Throws if no V is found - this indicates @setup_caching wasn't used correctly
 or create_ci wasn't called.
 """
 function results(::Type{V}, ci::Core.CodeInstance)::V where V
-    result = CC.traverse_analysis_results(ci) do @nospecialize result
-        result isa V ? result : nothing
+    cached = CC.traverse_analysis_results(ci) do @nospecialize result
+        result isa CachedResult{V} ? result : nothing
     end
-    @assert result !== nothing "CodeInstance missing $V results - ensure @setup_caching is used or create_ci was called"
-    return result
+    @assert cached !== nothing "CodeInstance missing $V results - ensure @setup_caching is used or create_ci was called"
+    return cached.inner
 end
 
 results(::CacheView{K,V}, ci::Core.CodeInstance) where {K,V} = results(V, ci)
+
+"""
+    results(::Type{V}, ci::CodeInstance, argtypes::Vector{Any})::V
+    results(cache::CacheView{K,V}, ci::CodeInstance, argtypes::Vector{Any})::V
+
+Retrieve const-specialized results for a specific set of argument types.
+"""
+function results(::Type{V}, ci::Core.CodeInstance, argtypes::Vector{Any})::V where V
+    cached = CC.traverse_analysis_results(ci) do @nospecialize result
+        result isa CachedResult{V} ? result : nothing
+    end
+    @assert cached !== nothing "CodeInstance missing $V results for argtypes $argtypes"
+    for entry in cached.const_entries
+        entry.argtypes == argtypes && return entry.inner
+    end
+    error("CodeInstance missing $V results for argtypes $argtypes")
+end
+
+results(::CacheView{K,V}, ci::Core.CodeInstance, argtypes::Vector{Any}) where {K,V} =
+    results(V, ci, argtypes)
 
 @static if VERSION >= v"1.14-"
     function code_cache(cache::CacheView)
@@ -335,6 +438,109 @@ function typeinf!(cache::CacheView, interp::CC.AbstractInterpreter,
 end
 
 """
+    typeinf!(cache, interp, mi, argtypes) -> Nothing
+
+Run const-seeded type inference on `mi` with enriched `argtypes` and store the result
+as a `CachedResult` entry on the generic CI's `analysis_results` chain.
+
+Uses Julia's ephemeral `:local` inference mode (same as internal const-prop) so no
+new CodeInstance is created. The const-specialized source and return type are stored
+alongside the generic result for later retrieval via `results(cache, ci, argtypes)`
+and `get_source(ci, argtypes)`.
+"""
+function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
+                  mi::Core.MethodInstance, argtypes::Vector{Any}) where {K,V}
+    # Ensure generic CI exists
+    ci = get(cache, mi, nothing)
+    if ci === nothing
+        typeinf!(cache, interp, mi)
+        ci = get(cache, mi, nothing)
+        ci === nothing && return nothing
+    end
+
+    # Find the CachedResult on this CI
+    cached = CC.traverse_analysis_results(ci) do @nospecialize result
+        result isa CachedResult{V} ? result : nothing
+    end
+    @assert cached !== nothing "CodeInstance missing CachedResult{$V}"
+
+    # Check if we already have a const-prop result for these argtypes
+    for entry in cached.const_entries
+        entry.argtypes == argtypes && return
+    end
+
+    # Compute overridden_by_const
+    𝕃 = CC.typeinf_lattice(interp)
+    @static if VERSION >= v"1.12-"
+        default_argtypes = CC.matching_cache_argtypes(𝕃, mi)
+        overridden = BitVector(undef, length(argtypes))
+        for i in eachindex(argtypes)
+            overridden[i] = !CC.is_lattice_equal(𝕃, argtypes[i], default_argtypes[i])
+        end
+    else
+        default_argtypes, _ = CC.matching_cache_argtypes(𝕃, mi)
+        overridden = CC.BitVector(undef, length(argtypes))
+        for i in eachindex(argtypes)
+            CC.setindex!(overridden, !CC.is_lattice_equal(𝕃, argtypes[i], default_argtypes[i]), i)
+        end
+    end
+
+    # Run ephemeral inference (:local mode, no result.ci)
+    inf_result = CC.InferenceResult(mi, argtypes, overridden)
+    frame = CC.InferenceState(inf_result, #=cache_mode=# :local, interp)
+    if frame === nothing
+        return nothing
+    end
+    CC.typeinf(interp, frame)
+
+    # Convert OptimizationState → CodeInfo (preserves :invoke stmts)
+    src = inf_result.src
+    if src isa CC.OptimizationState
+        src = CC.ir_to_codeinf!(src)
+    end
+
+    # Extract V from ephemeral InferenceResult's analysis_results (stacked by finish!)
+    v = CC.traverse_analysis_results(inf_result) do @nospecialize r
+        r isa CachedResult{V} ? r.inner : nothing
+    end
+    if v === nothing
+        v = V()
+    end
+
+    # Compute rettype_const
+    rettype = inf_result.result
+    rettype_const = rettype isa CC.Const ? rettype.val : nothing
+
+    # Store const-prop entry on the mutable CachedResult
+    # (must happen before recursive walk so the duplicate check on lines 441-443 prevents cycles)
+    entry = SpecializedResult{V}(argtypes, v, src, rettype, rettype_const)
+    push!(cached.const_entries, entry)
+
+    # Recursively const-seed callees with propagated const argtypes.
+    # Walk the *generic* source (which has :invoke stmts pointing to callee CIs)
+    # to discover callees — the const-optimized source has :invoke stmts too, but
+    # the generic source gives us stable callee CIs for cache lookups.
+    generic_src = get_source(ci)
+    if generic_src isa Core.CodeInfo
+        sptypes = CC.sptypes_from_meth_instance(mi)
+        for stmt in generic_src.code
+            if stmt isa Expr && stmt.head === :(=)
+                stmt = stmt.args[2]
+            end
+            if stmt isa Expr && (stmt.head === :invoke ||
+                    (VERSION >= v"1.12-" && stmt.head === :invoke_modify))
+                callee_mi = get_invoke_mi(stmt)
+                callee_mi === nothing && continue
+                callee_argtypes = extract_invoke_argtypes(stmt, generic_src, sptypes, argtypes)
+                typeinf!(cache, interp, callee_mi, callee_argtypes)
+            end
+        end
+    end
+
+    return
+end
+
+"""
     create_ci(cache::CacheView{K,V}, mi; deps) -> CodeInstance
 
 Create a CodeInstance for `mi` with proper owner, typed results, and backedges.
@@ -352,8 +558,8 @@ function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
     owner = cache.owner
     edges = isempty(deps) ? Core.svec() : Core.svec(deps...)
 
-    # Create typed results instance via V()
-    ar = CC.AnalysisResults(V(), CC.NULL_ANALYSIS_RESULTS)
+    # Create typed results instance via CachedResult{V}
+    ar = CC.AnalysisResults(CachedResult{V}(V()), CC.NULL_ANALYSIS_RESULTS)
 
     @static if VERSION >= v"1.12-"
         ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
@@ -442,6 +648,26 @@ function get_source(ci::Core.CodeInstance)
 end
 
 """
+    get_source(ci::CodeInstance, argtypes::Vector{Any}) -> Union{CodeInfo, Nothing}
+
+Retrieve const-specialized CodeInfo from a CodeInstance's `CachedResult` chain.
+Returns `nothing` if no const-prop entry exists for the given argtypes.
+"""
+function get_source(ci::Core.CodeInstance, argtypes::Vector{Any})
+    cached = CC.traverse_analysis_results(ci) do @nospecialize result
+        result isa CachedResult ? result : nothing
+    end
+    cached === nothing && return nothing
+    for entry in cached.const_entries
+        if entry.argtypes == argtypes
+            src = entry.src
+            return src isa Core.CodeInfo ? src : nothing
+        end
+    end
+    return nothing
+end
+
+"""
     get_codeinfos(ci::CodeInstance) -> Vector{Pair{CodeInstance, CodeInfo}}
 
 Collect CodeInstance/CodeInfo pairs by walking forward edges from a root CI.
@@ -480,6 +706,35 @@ function get_codeinfos(ci::Core.CodeInstance)
     else
         src = get_source(ci)
         src !== nothing && push!(codeinfos, ci => src)
+    end
+    return codeinfos
+end
+
+"""
+    get_codeinfos(ci::CodeInstance, argtypes::Vector{Any}) -> Vector{Pair{CodeInstance, CodeInfo}}
+
+Collect CodeInstance/CodeInfo pairs using the const-optimized source for the root CI
+and generic source for all callees.
+
+Delegates to `get_codeinfos(ci)` for the full callee walk, then swaps the root entry's
+source with the const-optimized version from `get_source(ci, argtypes)`. Extra callees
+from the generic walk are harmless (compiled but uncalled), and missing callees get
+runtime dispatch stubs from `jl_emit_native`.
+
+Falls back to `get_codeinfos(ci)` if no const entry exists for the given argtypes.
+"""
+function get_codeinfos(ci::Core.CodeInstance, argtypes::Vector{Any})
+    const_src = get_source(ci, argtypes)
+    if const_src === nothing
+        return get_codeinfos(ci)
+    end
+    codeinfos = get_codeinfos(ci)
+    # Swap root entry's source with const-optimized version
+    idx = findfirst(p -> p.first === ci, codeinfos)
+    if idx !== nothing
+        codeinfos[idx] = ci => const_src
+    else
+        pushfirst!(codeinfos, ci => const_src)
     end
     return codeinfos
 end
