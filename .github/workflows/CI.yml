@@ -64,22 +64,14 @@ jobs:
 
   # fetching builds from Buildkite
   assert_test:
-    name: Julia ${{ matrix.branch }} (assert) - Linux
+    name: Julia ${{ matrix.version }} (assert) - Linux
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        branch: ['master']
-        pipeline: ['julia-master']
+        version: ['master', '1.11', '1.12']
         build: ['x86_64-linux-gnuassert']
-        include:
-          - branch: 'release-1.11'
-            pipeline: 'julia-release-1-dot-11'
-            build: 'x86_64-linux-gnuassert'
-          - branch: 'release-1.12'
-            pipeline: 'julia-release-1-dot-12'
-            build: 'x86_64-linux-gnuassert'
     steps:
       # First checkout base branch to get trusted download script
       - uses: actions/checkout@v6
@@ -88,7 +80,7 @@ jobs:
         env:
           BUILDKITE_TOKEN: ${{ secrets.BUILDKITE_TOKEN }}
         run: |
-          ./.github/download_build.sh ${{ matrix.pipeline }} ${{ matrix.branch }} build_${{ matrix.build }} julia.tar.gz
+          ./.github/download_build.sh ${{ matrix.version }} build_${{ matrix.build }} julia.tar.gz
           tar -xf julia.tar.gz -C ../
           rm julia.tar.gz
           echo $PWD/../julia-*/bin >> $GITHUB_PATH
