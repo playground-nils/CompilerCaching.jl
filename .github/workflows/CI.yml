@@ -23,7 +23,7 @@ jobs:
         version:
           - '1.11'
           - '1.12'
-          #- '1.13-nightly' # awaiting backports
+          - '1.13-nightly'
           - 'nightly'
         os:
           - Linux
