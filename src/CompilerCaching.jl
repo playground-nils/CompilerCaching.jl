@@ -274,6 +274,24 @@ end
 #==============================================================================#
 
 export add_method
+public captured_globals
+
+"""
+    captured_globals(source) -> iterable of GlobalRef
+
+Return the `GlobalRef`s a foreign IR `source` captures. Override this for
+your custom IR type to enable automatic binding-invalidation tracking; the
+default returns none.
+
+[`create_ci`](@ref) consults this hook to wire the referenced bindings into
+the runtime's invalidation mechanism without the caller having to thread
+them through manually.
+
+Report only bindings the IR actually reads: over-reporting causes spurious
+invalidations. The result must be stable for the lifetime of `source` —
+edges are registered on every CI created for a method using this source.
+"""
+captured_globals(@nospecialize(source)) = ()
 
 """
     add_method(mt, f, arg_types, source) -> Method
@@ -285,6 +303,11 @@ Register a method with custom source IR in the cache's method table.
 - `f::Function` - The function to add a method to
 - `arg_types::Tuple` - Argument types for this method
 - `source` - Custom IR to store (any type)
+
+If `source` captures global bindings, override [`captured_globals`](@ref)
+for its type. The bindings are then registered as edges of every
+[`create_ci`](@ref) call for this method, so the cached code is
+invalidated whenever any of them is replaced.
 
 # Returns
 The created `Method` object.
@@ -305,6 +328,17 @@ function add_method(mt::Core.MethodTable, f::Function, arg_types::Tuple, source)
     m.external_mt = mt
     m.slot_syms = ""
     m.source = source
+
+    # For non-CodeInfo sources, mark the source as scanned *before* publishing
+    # the method, so any concurrent retrieve_code_info / jl_scan_method_source_now
+    # skips its CodeInfo-only scan (which would otherwise crash trying to
+    # uncompress foreign IR). For CodeInfo sources the bit is left untouched so
+    # Julia's own scan still runs.
+    @static if VERSION >= v"1.12-"
+        if !isa(source, Core.CodeInfo)
+            @atomic m.did_scan_source |= 0x1
+        end
+    end
 
     ccall(:jl_method_table_insert, Cvoid, (Any, Any, Any), mt, m, nothing)
 
@@ -658,14 +692,40 @@ Creates a new CodeInstance with:
 - Owner set to `cache.owner`
 - A fresh `V()` instance in analysis_results
 - Backedges registered for all dependencies in `deps`
+- Per-CI binding edges, so that the resulting CodeInstance is invalidated
+  whenever any binding the source captures is replaced. The set of
+  `GlobalRef`s is taken from [`captured_globals(mi.def.source)`](@ref captured_globals).
 
 Used for foreign mode where inference doesn't run. The CI participates in
-Julia's invalidation mechanism via backedges registered from `deps`.
+Julia's invalidation mechanism via backedges registered from `deps` (callee
+methods) and the `captured_globals` hook (referenced global bindings).
+
+The asymmetry between `deps` (explicit kwarg) and bindings (implicit trait)
+is intentional. Captured bindings are a property of the source IR — fixed at
+method definition and shared across every specialization — so it's natural
+to pin them to the source type once via [`captured_globals`](@ref) and have
+`create_ci` consult them. Dependencies, by contrast, are discovered per
+compilation: the same method may invoke different callees depending on the
+argument types of `mi`.
 """
 function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
                    deps::Vector{Core.MethodInstance}=Core.MethodInstance[]) where {K,V}
     owner = cache.owner
-    edges = isempty(deps) ? Core.svec() : Core.svec(deps...)
+
+    @static if VERSION >= v"1.12-"
+        binding_edges = Core.Binding[]
+        if isa(mi.def, Core.Method) && isdefined(mi.def, :source)
+            for e in captured_globals(mi.def.source)
+                push!(binding_edges,
+                      e isa Core.Binding ? e : convert(Core.Binding, e::GlobalRef))
+            end
+        end
+        edges = isempty(deps) && isempty(binding_edges) ?
+            Core.svec() : Core.svec(deps..., binding_edges...)
+    else
+        # Julia 1.11 has no per-CI edges field
+        edges = isempty(deps) ? Core.svec() : Core.svec(deps...)
+    end
 
     # Create typed results instance via CachedResult{V}
     ar = CC.AnalysisResults(CachedResult{V}(V()), CC.NULL_ANALYSIS_RESULTS)
@@ -681,6 +741,19 @@ function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
     # Register backedges for automatic invalidation
     if !isempty(deps)
         store_backedges(mi, ci, deps)
+    end
+
+    @static if VERSION >= v"1.12-"
+        # Register the CI as a direct edge of each captured binding. We
+        # deliberately bypass `jl_maybe_add_binding_backedge` (which would
+        # register the *Method* and route same-module invalidations through
+        # `invalidate_method_for_globalref!`); that path tries to
+        # `_uncompressed_ir(method)` and crashes on non-CodeInfo source.
+        # Going CI-direct means binding replacement invalidates the CI via
+        # the `isa(edge, CodeInstance)` branch in `invalidate_code_for_globalref!`.
+        for b in binding_edges
+            ccall(:jl_add_binding_backedge, Cvoid, (Any, Any), b, ci)
+        end
     end
 
     return ci
