@@ -1,20 +1,18 @@
 name: Test
-
-on:
+'on':
   push:
     branches:
-      - main
-    tags: ["*"]
-  pull_request:
-  workflow_dispatch:
-
+    - main
+    tags:
+    - '*'
+  pull_request: null
+  workflow_dispatch: null
 permissions:
   contents: read
-
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref
+    }}
   cancel-in-progress: true
-
 jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }}
@@ -24,41 +22,41 @@ jobs:
       fail-fast: false
       matrix:
         version:
-          - '1.11'
-          - '1.12'
-          - '1.13-nightly'
-          - 'nightly'
+        - '1.11'
+        - '1.12'
+        - 1.13-nightly
+        - nightly
         os:
-          - Linux
-          - Windows
-          - macOS
+        - Linux
+        - Windows
+        - macOS
         arch:
-          - x64
-          - aarch64
+        - x64
+        - aarch64
         exclude:
-          - os: Windows
-            arch: aarch64
-          - os: macOS
-            arch: x64
+        - os: Windows
+          arch: aarch64
+        - os: macOS
+          arch: x64
         include:
-          - os: Linux
-            arch: x64
-            runner: ubuntu-latest
-          - os: Linux
-            arch: aarch64
-            runner: ubuntu-24.04-arm
-          - os: Windows
-            arch: x64
-            runner: windows-latest
-          - os: macOS
-            arch: aarch64
-            runner: macos-latest
+        - os: Linux
+          arch: x64
+          runner: ubuntu-latest
+        - os: Linux
+          arch: aarch64
+          runner: ubuntu-latest
+        - os: Windows
+          arch: x64
+          runner: windows-latest
+        - os: macOS
+          arch: aarch64
+          runner: macos-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: julia-actions/setup-julia@v2
-        with:
-          version: ${{ matrix.version }}
-          arch: ${{ matrix.arch }}
-      - uses: julia-actions/cache@v2
-      - uses: julia-actions/julia-buildpkg@v1
-      - uses: julia-actions/julia-runtest@v1
+    - uses: actions/checkout@v6
+    - uses: julia-actions/setup-julia@v2
+      with:
+        version: ${{ matrix.version }}
+        arch: ${{ matrix.arch }}
+    - uses: julia-actions/cache@v2
+    - uses: julia-actions/julia-buildpkg@v1
+    - uses: julia-actions/julia-runtest@v1
